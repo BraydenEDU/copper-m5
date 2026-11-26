@@ -1,8 +1,16 @@
 name: CI
 
+# Module 5: every pull request runs the tests (check) and the golden-set evals
+# with the AI judge (evals). Branch protection on main requires both to pass,
+# so a pull request with failing tests or evals can't be merged.
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   check:
@@ -23,3 +31,89 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  evals:
+    # The golden set on both versions of Ask Copper (two agents, and one
+    # support agent), graded by the AI judge. Scores go to Langfuse and into
+    # this pull request's checks ("Eval scores"). Fails when the version that
+    # ships passes fewer than EVAL_MIN_PASS_RATE of the cases.
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    env:
+      GOOGLE_GENERATIVE_AI_API_KEY: ${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
+      LANGFUSE_PUBLIC_KEY: ${{ secrets.LANGFUSE_PUBLIC_KEY }}
+      LANGFUSE_SECRET_KEY: ${{ secrets.LANGFUSE_SECRET_KEY }}
+      LANGFUSE_BASE_URL: ${{ secrets.LANGFUSE_BASE_URL }}
+      EVAL_MODES: multi,single
+      EVAL_MIN_PASS_RATE: "0.8"
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - name: Name this run in Langfuse
+        shell: bash
+        run: echo "EVAL_RUN_LABEL=${PR_NUMBER:+pr$PR_NUMBER-}${HEAD_SHA::7}" >> "$GITHUB_ENV"
+      - name: Run the golden-set evals
+        run: npm run eval
+      - name: Put the eval scores in the pull request's checks
+        if: always() && hashFiles('eval-results/results.json') != ''
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require("fs");
+            const summary = fs.readFileSync("eval-results/summary.md", "utf8");
+            const { results, minPassRate, gateMode } = JSON.parse(
+              fs.readFileSync("eval-results/results.json", "utf8"),
+            );
+            const label = { multi: "Two agents", single: "One agent" };
+            const pct = (n) => `${Math.round(n * 100)}%`;
+            const gate = results.find((r) => r.mode === gateMode) ?? results[0];
+            const passed = gate.passRate >= minPassRate;
+            const title = results
+              .map((r) => `${label[r.mode]} ${pct(r.passRate)} · $${r.avgCostUsd.toFixed(4)} · ${(r.avgLatencyMs / 1000).toFixed(1)}s`)
+              .join("  |  ");
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: "Eval scores",
+              head_sha: process.env.HEAD_SHA,
+              status: "completed",
+              conclusion: passed ? "success" : "failure",
+              output: {
+                title: `${title} (needs ${pct(minPassRate)})`,
+                summary,
+              },
+            });
+            if (!process.env.PR_NUMBER) return;
+            const marker = "<!-- ask-copper-evals -->";
+            const body = `${marker}\n${summary}`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: Number(process.env.PR_NUMBER),
+            });
+            const old = comments.find((c) => c.body?.startsWith(marker));
+            if (old)
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: old.id,
+                body,
+              });
+            else
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: Number(process.env.PR_NUMBER),
+                body,
+              });

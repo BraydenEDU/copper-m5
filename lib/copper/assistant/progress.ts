@@ -2,12 +2,19 @@
 // summaries, each tool call (with what went in and what came out), and the
 // reply. The panel draws this as it changes.
 
-/** Who is answering: Copper, or the Refund agent after a handoff (Module 4). */
-export type Agent = "copper" | "refund";
+/**
+ * Who is answering: Copper, or the Refund agent after a handoff (Module 4),
+ * or the one support agent that does everything (Module 5, AGENT_MODE=single).
+ */
+export type Agent = "copper" | "refund" | "support";
+
+/** Two agents with a handoff (Module 4), or one that does everything (Module 5). */
+export type AgentMode = "multi" | "single";
 
 export const AGENT_NAMES: Record<Agent, string> = {
   copper: "Copper",
   refund: "Refund agent",
+  support: "Support agent",
 };
 
 export type ThinkingStep = { type: "thinking"; text: string; agent?: Agent };
@@ -71,4 +78,13 @@ export const AGENT_TOOLS: Record<Agent, string[]> = {
     "search_docs",
   ],
   refund: ["get_orders", "request_refund", "transfer_to_copper"],
+  support: [
+    "get_products",
+    "get_prices",
+    "calculate_cost",
+    "check_availability",
+    "search_docs",
+    "get_orders",
+    "request_refund",
+  ],
 };

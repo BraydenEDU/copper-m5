@@ -15,6 +15,7 @@ import {
   WrenchIcon,
   XIcon,
 } from "lucide-react";
+import { nanoid } from "nanoid";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { SetupRequired } from "@/components/setup-required";
 import { Button } from "@/components/ui/button";
@@ -82,6 +83,9 @@ export function AskCopper({
   const [useTools, setUseTools] = useState(true);
   const [chats, setChats] = useState<Chats>({ tools: [], noTools: [] });
   const [draft, setDraft] = useState("");
+  // Module 5: one id per visit, so Langfuse groups a conversation's turns.
+  // Made on the first message, not while rendering, so the page can prerender.
+  const sessionId = useRef<string>(undefined);
   const body = useRef<HTMLDivElement>(null);
 
   const key = useTools ? "tools" : "noTools";
@@ -152,6 +156,7 @@ export function AskCopper({
       const { progress } = await askCopper({
         messages,
         useTools: chat === "tools",
+        sessionId: (sessionId.current ??= nanoid()),
         // Module 4: the console's desk, and who is talking. A console note
         // always goes to the Refund agent.
         ...(support && {

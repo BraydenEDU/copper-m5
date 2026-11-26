@@ -8,11 +8,14 @@ import {
   MODELS,
   type ModelId,
 } from "@/lib/ai/models";
+import { currentTrace, generation, withTrace } from "@/lib/ai/langfuse";
 import { costUsd } from "@/lib/ai/pricing";
 
 // Every model call in the app goes through this file, so each one is logged
 // with its tokens, cost and how long it took. The log goes to the terminal
 // running the app, as a line starting "[ai_calls]".
+// Module 5: each call is also a generation in Langfuse (lib/ai/langfuse.ts),
+// under whichever agent or eval is running it (see withTrace).
 
 export class AiNotConfiguredError extends Error {
   constructor() {
@@ -71,6 +74,40 @@ async function logCall(row: AiCallRow): Promise<void> {
   console.info("[ai_calls]", JSON.stringify(row));
 }
 
+/** What a call sent the model, for its Langfuse generation. */
+function promptOf(options: {
+  instructions?: unknown;
+  system?: unknown;
+  messages?: unknown;
+  prompt?: unknown;
+}) {
+  const { instructions, system, messages, prompt } = options;
+  return { instructions: instructions ?? system, messages: messages ?? prompt };
+}
+
+/** Records the call in Langfuse when it runs inside a trace. */
+function traceCall(
+  info: CallInfo,
+  row: AiCallRow,
+  startTime: string,
+  content: { input?: unknown; output?: unknown },
+) {
+  const parent = currentTrace();
+  if (!parent) return;
+  generation(parent, {
+    name: info.feature,
+    model: row.model,
+    startTime,
+    input: content.input,
+    output: content.output,
+    inputTokens: row.input_tokens,
+    outputTokens: row.output_tokens,
+    costUsd: row.cost_usd,
+    error: row.ok ? undefined : "The model call failed",
+    metadata: { module: info.module, latency_ms: row.latency_ms },
+  });
+}
+
 type Usage = { inputTokens?: number; outputTokens?: number };
 
 /** Builds the ai_calls row for a call that started at `started`. */
@@ -95,25 +132,33 @@ function rowFor(info: CallInfo, model: ModelId, started: number) {
   };
 }
 
-async function tracked<T extends { usage: Usage }>(
+async function tracked<T extends { usage: Usage; text?: string }>(
   info: CallInfo,
+  input: unknown,
   run: (model: ModelId) => Promise<T>,
 ): Promise<T> {
   const model = info.model ?? defaultModel();
   const row = rowFor(info, model, performance.now());
+  const startTime = new Date().toISOString();
   try {
     const result = await run(model);
-    await logCall(row(true, result.usage));
+    const done = row(true, result.usage);
+    traceCall(info, done, startTime, { input, output: result.text });
+    await logCall(done);
     return result;
   } catch (error) {
-    if (!(error instanceof AiNotConfiguredError)) await logCall(row(false));
+    if (!(error instanceof AiNotConfiguredError)) {
+      const failed = row(false);
+      traceCall(info, failed, startTime, { input });
+      await logCall(failed);
+    }
     throw error;
   }
 }
 
 /** Generates text. Example: callText({ module: 3, feature: "support-answer" }, { prompt }) */
 export async function callText(info: CallInfo, options: TextOptions) {
-  return tracked(info, (model) =>
+  return tracked(info, promptOf(options), (model) =>
     generateText({ ...options, model: languageModel(model) }),
   );
 }
@@ -124,7 +169,7 @@ export async function callObject<Schema extends z.ZodType>(
   options: TextOptions & { schema: Schema },
 ) {
   const { schema, ...rest } = options;
-  const result = await tracked(info, (model) =>
+  const result = await tracked(info, promptOf(rest), (model) =>
     generateText({
       ...rest,
       model: languageModel(model),
@@ -145,9 +190,10 @@ export async function callEmbedMany(
   values: string[],
 ) {
   const started = performance.now();
+  const startTime = new Date().toISOString();
   // Google doesn't report tokens for embeddings, so tokens and cost are null.
-  const log = (ok: boolean) =>
-    logCall({
+  const log = (ok: boolean) => {
+    const row: AiCallRow = {
       module: info.module,
       feature: info.feature,
       model: EMBEDDING_MODEL,
@@ -157,7 +203,13 @@ export async function callEmbedMany(
       latency_ms: Math.round(performance.now() - started),
       ok,
       created_at: new Date().toISOString(),
+    };
+    traceCall(info, row, startTime, {
+      input: values,
+      output: `${values.length} embedding(s)`,
     });
+    return logCall(row);
+  };
   try {
     const result = await embedMany({
       model: google().embedding(EMBEDDING_MODEL.slice("google/".length)),
@@ -187,11 +239,31 @@ type StreamOptions = DistributiveOmit<
 export function callStream(info: CallInfo, options: StreamOptions) {
   const model = info.model ?? defaultModel();
   const row = rowFor(info, model, performance.now());
+  const startTime = new Date().toISOString();
+  // Read now: the callbacks run later, maybe outside this trace's context.
+  const parent = currentTrace();
+  const input = promptOf(options);
+  // A failed stream can call onError and then onFinish: report it once.
+  let reported = false;
+  const finish = (done: AiCallRow, output?: unknown) => {
+    if (reported) return;
+    reported = true;
+    withTrace(parent, () =>
+      traceCall(info, done, startTime, { input, output }),
+    );
+    return logCall(done);
+  };
   return streamText({
     ...options,
     model: languageModel(model),
-    onFinish: ({ totalUsage }) => logCall(row(true, totalUsage)),
-    onError: () => logCall(row(false)),
+    onFinish: ({ totalUsage, text, steps }) =>
+      finish(row(true, totalUsage), {
+        text,
+        toolCalls: steps.flatMap((step) =>
+          step.toolCalls.map(({ toolName, input }) => ({ toolName, input })),
+        ),
+      }),
+    onError: () => finish(row(false)),
   });
 }
 
