@@ -4,7 +4,11 @@ The starter app for CIS 591. Copper State Labs is a fictional Arizona company
 (see the [Product Bible](docs/copper-state-labs/product-bible.md)); each module
 adds a feature to this one app.
 
-This is the Module 5 starting point: the Copper site with Ask Copper and the
+Module 5 (this branch) adds tests and evals in CI, Langfuse tracing, an AI
+judge on a golden set, and a one-agent version to compare with the two agents:
+see "Module 5" in [`docs/architecture.md`](docs/architecture.md).
+
+This started as the Module 5 starting point: the Copper site with Ask Copper and the
 Refund Console from Module 4, where Copper hands refunds to the Refund agent
 and a person approves or rejects refunds over the auto-refund limit. In class
 we make Ask Copper safe to ship. The
@@ -30,23 +34,27 @@ Or open the repo in **GitHub Codespaces**: it installs everything and starts the
 
 They're optional until a module needs them. Put them in `.env.local` (never commit it) and in your Vercel project settings.
 
-| Variable                                     | Used for                                | Where to find it                                                                            |
-| -------------------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------- |
-| `GOOGLE_GENERATIVE_AI_API_KEY`               | All AI calls (`lib/ai/call.ts`)         | [Google AI Studio](https://aistudio.google.com) > Get API key (free, no card)               |
-| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | Module 5: evals, tracing and monitoring | [Langfuse Cloud](https://cloud.langfuse.com) > new project > Create API keys (free)         |
-| `LANGFUSE_BASE_URL`                          | Module 5: your Langfuse region          | The `LANGFUSE_BASE_URL` Langfuse shows next to your keys, e.g. `https://cloud.langfuse.com` |
+| Variable                                     | Used for                                                                       | Where to find it                                                                            |
+| -------------------------------------------- | ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------- |
+| `GOOGLE_GENERATIVE_AI_API_KEY`               | All AI calls (`lib/ai/call.ts`)                                                | [Google AI Studio](https://aistudio.google.com) > Get API key (free, no card)               |
+| `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY` | Module 5: evals, tracing and monitoring                                        | [Langfuse Cloud](https://cloud.langfuse.com) > new project > Create API keys (free)         |
+| `LANGFUSE_BASE_URL`                          | Module 5: your Langfuse region                                                 | The `LANGFUSE_BASE_URL` Langfuse shows next to your keys, e.g. `https://cloud.langfuse.com` |
+| `AGENT_MODE`                                 | Module 5: `single` runs one support agent instead of Copper + the Refund agent | Optional; two agents is the default                                                         |
 
 ## Commands
 
-| Command                              | What it does                                          |
-| ------------------------------------ | ----------------------------------------------------- |
-| `npm run dev`                        | Start the dev server                                  |
-| `npm test`                           | Run the app's tests                                   |
-| `npm run lint` / `npm run typecheck` | Check code style and types                            |
-| `npm run format`                     | Format the code with Prettier                         |
-| `npm run start-module`               | One-time setup after cloning a module branch          |
-| `npm run env:check`                  | List the variables in `.env.local`, values masked     |
-| `npm run embed-docs`                 | Re-embed the PDFs in `public/docs/` after they change |
+| Command                              | What it does                                                                                 |
+| ------------------------------------ | -------------------------------------------------------------------------------------------- |
+| `npm run dev`                        | Start the dev server                                                                         |
+| `npm test`                           | Run the app's tests                                                                          |
+| `npm run lint` / `npm run typecheck` | Check code style and types                                                                   |
+| `npm run format`                     | Format the code with Prettier                                                                |
+| `npm run start-module`               | One-time setup after cloning a module branch                                                 |
+| `npm run env:check`                  | List the variables in `.env.local`, values masked                                            |
+| `npm run embed-docs`                 | Re-embed the PDFs in `public/docs/` after they change                                        |
+| `npm run eval`                       | Module 5: golden-set evals with the AI judge, scores to Langfuse (`EVAL_MODES=multi,single`) |
+| `sh scripts/set-langfuse-keys.sh`    | Module 5: paste your Langfuse keys into `.env.local` (hidden)                                |
+| `sh scripts/set-ci-secrets.sh`       | Module 5: copy the Gemini and Langfuse keys into the repo's Actions secrets                  |
 
 ## AI coding agents
 

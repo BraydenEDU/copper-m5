@@ -312,6 +312,8 @@ describe("Part A: the Ask Copper chat widget", () => {
         },
       ],
       useTools: true,
+      // Module 5: groups the conversation in Langfuse.
+      sessionId: expect.any(String),
     });
 
     // A follow-up in the same conversation carries the earlier turns.
@@ -336,6 +338,8 @@ describe("Part A: the Ask Copper chat widget", () => {
         },
       ],
       useTools: false,
+      // Module 5: groups the conversation in Langfuse.
+      sessionId: expect.any(String),
     });
 
     // Switching back shows the tools-on conversation again.
