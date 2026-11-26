@@ -179,31 +179,35 @@ the golden-set evals in GitHub Actions, and `main` is protected so nothing
 merges unless both pass. Every chat is traced in Langfuse. An AI judge grades
 Ask Copper on a golden set and the scores go to Langfuse. The same golden set
 runs on the two agents (Copper and the Refund agent) and on one support agent
-with all the tools, and Langfuse compares them.
+with all the tools, as two Langfuse experiments compared side by side.
 
 | Piece | Where | What it does |
 |---|---|---|
-| Tracing | `lib/ai/langfuse.ts`, `lib/ai/call.ts`, `lib/copper/assistant/ask.ts` | Each chat turn is a trace (`ask-copper`, tagged `multi-agent` or `single-agent`, grouped by the panel's session id). Inside: a span per agent, a span per tool call (input and output), a `handoff` event, and a generation per model call with model, tokens, cost (from `lib/ai/pricing.ts`) and time. Events go to Langfuse's public ingestion API in one batch at the end of the turn (3 s cap). No keys, nothing sent |
+| Tracing | `lib/ai/langfuse.ts`, `lib/ai/call.ts`, `lib/copper/assistant/ask.ts` | Each chat turn is a trace (`ask-copper`, tagged `multi-agent` or `single-agent`, grouped by the panel's session id). Inside: an agent observation per agent, a tool observation per tool call (input and output), a `handoff` event, and a generation per model call with model, tokens, cost (from `lib/ai/pricing.ts`) and time. Sent as OpenTelemetry spans to Langfuse's OTLP endpoint (`/api/public/otel/v1/traces`, Langfuse v4 attribute names) in one batch at the end of the turn (3 s cap). No keys, nothing sent |
 | One support agent | `SUPPORT_AGENT_INSTRUCTIONS` in `instructions.ts`, `supportAgentTools` in `tools.ts` | Copper's tools plus `get_orders` and `request_refund`, no handoff. `AGENT_MODE=single` (or `mode: "single"`) uses it; two agents is the default |
 | Golden set | `evals/golden-set.ts` | 15 customer questions (products, docs, refunds, safety), each with what a good answer does and the tools it must or must not call. Tools, not agents, so one set grades both versions |
 | AI judge | `evals/judge.ts` | Gemini through `callObject` (`{ module: 5, feature: "eval-judge" }`) grades each reply 1-5 and pass/fail against the case, with the tool results as the truth. Tool checks are code |
-| Eval runner | `evals/run.ts`, `evals/golden.eval.ts`, `npm run eval` | Syncs the golden set to the Langfuse dataset `ask-copper-golden-set`, asks every question on each version, adds `judge_score`, `tool_use` and `passed` scores to each answer's trace, and links the traces to a dataset run per version (`multi-agent …`, `single-agent …`) so Langfuse compares pass rate, cost and time. Writes `eval-results/summary.md`. Fails under 80% for the version that ships. `EVAL_MODES`, `EVAL_CASES`, `EVAL_MIN_PASS_RATE` tune it |
+| Eval runner | `evals/run.ts`, `evals/golden.eval.ts`, `npm run eval` | Syncs the golden set to the Langfuse dataset `ask-copper-golden-set`, runs each version as a Langfuse experiment on it (`multi-agent …`, `single-agent …`: every answer's trace carries the `langfuse.experiment.*` attributes), and puts `judge_score`, `tool_use` and `passed` scores on each answer's root observation. Langfuse then compares the experiments' scores, cost and time. Writes `eval-results/summary.md`. Fails under 80% for the version that ships. `EVAL_MODES`, `EVAL_CASES`, `EVAL_MIN_PASS_RATE` tune it |
 | CI | `.github/workflows/ci.yml` | `check` (lint, typecheck, tests, build on Linux, macOS, Windows) and `evals` (both versions; posts an "Eval scores" check and a comment on the pull request). Keys come from the repo's Actions secrets (`scripts/set-ci-secrets.sh`) |
 | Branch protection | GitHub settings for `main` | Pull requests only, `check` on all three systems and `evals` must pass, no direct pushes, admins included |
 
-**Data flow:** question → `askCopper` starts a trace → agent span → model
-call (generation) → tool spans → handoff → … → reply → trace sent to
-Langfuse. Eval: golden case → `askCopper` (trace) → judge (its own
-`eval-judge` trace, so it doesn't add to the answer's cost) → scores on the
-answer's trace → dataset run item.
+**Data flow:** question → `askCopper` starts a trace → agent observation →
+model call (generation) → tool observations → handoff → … → reply → spans
+sent to Langfuse. Eval: golden case → `askCopper` (an experiment item trace)
+→ judge (its own `eval-judge` trace, so it doesn't add to the answer's cost)
+→ scores on the answer's root observation.
 
-**Decisions and trade-offs:** Langfuse's public API over `fetch` instead of an
-SDK: no new packages, works the same in the app, the tests and CI. The judge
-uses the same cheap model as the app, at temperature 0; an LLM judge can still
-be wrong, so the code checks the tools and the gate is a pass rate, not every
-case. Both versions run in CI so every pull request shows the comparison.
+**Decisions and trade-offs:** Langfuse Cloud switched off its old ingestion
+API for traces and its dataset-run API on 2026-11-16, so traces go in as
+OpenTelemetry spans and eval runs are experiments. The spans are built by hand
+and posted with `fetch` (no new packages), which works the same in the app,
+the tests and CI. The judge uses the same cheap model as the app, at
+temperature 0; an LLM judge can still be wrong, so the code checks the tools
+and the gate is a pass rate, not every case. Both versions run in CI so every
+pull request shows the comparison.
 
 **Risks and open questions:** Evals call the real model, so they cost money,
 take a few minutes and can flake on a busy model (each case retries). A pull
 request from a fork has no secrets, so its evals can't run. The judge sees
-only the final reply and the tools, not the thinking.
+only the final reply and the tools, not the thinking. Langfuse's reads lag a
+few minutes behind writes.

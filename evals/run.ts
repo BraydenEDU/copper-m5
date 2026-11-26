@@ -4,17 +4,20 @@
 // - the judge's grade goes on that trace as scores (judge_score, passed,
 //   tool_use);
 // - the golden set is a Langfuse dataset, and each version's run (two agents
-//   or one support agent) is a dataset run, so Langfuse compares their scores,
-//   cost and time side by side.
+//   or one support agent) is a Langfuse experiment on it, so Langfuse compares
+//   their scores, cost and time side by side.
 import { execSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
+  discardTrace,
+  type ExperimentItem,
   flushLangfuse,
   isLangfuseConfigured,
   langfuseApi,
+  langfuseBaseUrl,
   score,
   trace,
   traceTotals,
-  traceUrl,
   withTrace,
 } from "@/lib/ai/langfuse";
 import { finalValue } from "@/lib/ai/live";
@@ -74,8 +77,8 @@ function gitLabel(): string {
   }
 }
 
-/** The golden set as a Langfuse dataset (created once, items kept in sync). */
-async function syncDataset() {
+/** The golden set as a Langfuse dataset (created once, items kept in sync). Returns its id. */
+async function syncDataset(): Promise<string | undefined> {
   if (!isLangfuseConfigured()) return;
   try {
     await langfuseApi("/api/public/datasets", {
@@ -107,35 +110,41 @@ async function syncDataset() {
       console.warn("[evals] dataset item", c.id, (error as Error).message);
     }
   }
-}
-
-/** Links an answer's trace to this run of the dataset. */
-async function linkToRun(
-  runName: string,
-  mode: AgentMode,
-  c: GoldenCase,
-  traceId: string,
-) {
-  if (!isLangfuseConfigured()) return;
   try {
-    await langfuseApi("/api/public/dataset-run-items", {
-      body: {
-        runName,
-        runDescription: MODE_LABELS[mode],
-        datasetItemId: `golden-${c.id}`,
-        traceId,
-        metadata: { mode },
-      },
-    });
-  } catch (error) {
-    console.warn("[evals] run item", c.id, (error as Error).message);
+    const dataset = (await langfuseApi(
+      `/api/public/v2/datasets/${encodeURIComponent(DATASET)}`,
+    )) as { id: string };
+    return dataset.id;
+  } catch {
+    return undefined;
   }
 }
 
+/** One golden-set case as an item of this run's Langfuse experiment. */
+function experimentItem(
+  experiment: Omit<ExperimentItem, "itemId">,
+  c: GoldenCase,
+): ExperimentItem {
+  return {
+    ...experiment,
+    itemId: `golden-${c.id}`,
+    expectedOutput: {
+      good: c.good,
+      mustCall: c.mustCall,
+      mustNotCall: c.mustNotCall,
+    },
+  };
+}
+
 /** Asks Ask Copper one golden-set question, the way the Support page does. */
-async function answer(mode: AgentMode, c: GoldenCase, runName: string) {
+async function answer(
+  mode: AgentMode,
+  c: GoldenCase,
+  runName: string,
+  experiment: ExperimentItem,
+) {
   const started = performance.now();
-  const { progress, traceId } = await askCopper({
+  const { progress, traceId, observationId } = await askCopper({
     messages: c.messages,
     useTools: true,
     desk: c.desk ?? { limitUsd: DEFAULT_LIMIT_USD, refunds: [] },
@@ -143,24 +152,36 @@ async function answer(mode: AgentMode, c: GoldenCase, runName: string) {
     mode,
     sessionId: runName,
     tags: ["eval", `case:${c.id}`],
+    experiment,
+    holdTrace: true,
   });
   const final: Progress = await finalValue(progress);
-  return { final, traceId, latencyMs: Math.round(performance.now() - started) };
+  return {
+    final,
+    traceId,
+    observationId,
+    latencyMs: Math.round(performance.now() - started),
+  };
 }
 
 async function runCase(
   mode: AgentMode,
   c: GoldenCase,
   runName: string,
+  experiment: Omit<ExperimentItem, "itemId">,
 ): Promise<CaseResult> {
+  const item = experimentItem(experiment, c);
   let attempt = 0;
-  let result = await answer(mode, c, runName);
+  let result = await answer(mode, c, runName, item);
   // A busy model (rate limit) can fail a turn; try it again before grading.
+  // Only the final attempt is graded and kept: a Langfuse experiment has one
+  // trace per item.
   while (result.final.status === "error" && attempt++ < 2) {
+    discardTrace(result.traceId);
     await sleep(10_000 * attempt);
-    result = await answer(mode, c, runName);
+    result = await answer(mode, c, runName, item);
   }
-  const { final, traceId, latencyMs } = result;
+  const { final, traceId, observationId, latencyMs } = result;
   const calls = toolCallsOf(final);
   const toolProblems = checkTools(c, calls);
 
@@ -187,26 +208,30 @@ async function runCase(
       }
     }
     if (verdict) error = undefined;
+    judgeTrace.end(verdict ?? error);
   }
 
   const passed = Boolean(verdict?.pass) && toolProblems.length === 0;
   const comment = [verdict?.reasoning, ...toolProblems]
     .filter(Boolean)
     .join(" ");
+  // On the trace's root observation, where Langfuse experiments read them.
   if (verdict)
     score(traceId, "judge_score", (verdict.score - 1) / 4, {
       comment: `${verdict.score}/5. ${verdict.reasoning}`,
+      observationId,
     });
   score(traceId, "tool_use", toolProblems.length ? 0 : 1, {
     dataType: "BOOLEAN",
     comment: toolProblems.join("; ") || "Used the right tools.",
+    observationId,
   });
   score(traceId, "passed", passed ? 1 : 0, {
     dataType: "BOOLEAN",
     comment: error ?? comment,
+    observationId,
   });
   await flushLangfuse();
-  await linkToRun(runName, mode, c, traceId);
 
   const totals = traceTotals(traceId);
   return {
@@ -233,12 +258,21 @@ const average = (values: number[]) =>
 export async function runMode(
   mode: AgentMode,
   cases: GoldenCase[] = GOLDEN_SET,
+  datasetId?: string,
 ): Promise<ModeResult> {
   const stamp = new Date().toISOString().slice(0, 16).replace("T", " ");
   const runName = `${mode}-agent ${gitLabel()} ${stamp}`;
+  // This run is one Langfuse experiment on the golden-set dataset.
+  const experiment = {
+    id: randomUUID(),
+    name: runName,
+    description: MODE_LABELS[mode],
+    datasetId,
+    metadata: { mode, commit: gitLabel() },
+  };
   const results: CaseResult[] = [];
   for (const c of cases) {
-    const r = await runCase(mode, c, runName);
+    const r = await runCase(mode, c, runName, experiment);
     console.info(
       `[evals] ${mode} ${r.passed ? "PASS" : "FAIL"} ${c.id} (${r.verdict?.score ?? "-"}/5, ${(r.latencyMs / 1000).toFixed(1)}s, $${r.costUsd.toFixed(5)})${r.passed ? "" : ` ${r.error ?? r.toolProblems.join("; ") ?? ""} ${r.verdict?.reasoning ?? ""}`}`,
     );
@@ -260,14 +294,14 @@ export async function runMode(
 }
 
 export async function runEvals(modes: AgentMode[]) {
-  await syncDataset();
+  const datasetId = await syncDataset();
   const results: ModeResult[] = [];
   // EVAL_CASES=colors,stock runs just those cases (for a quick check).
   const only = process.env.EVAL_CASES?.split(",").map((id) => id.trim());
   const cases = only
     ? GOLDEN_SET.filter((c) => only.includes(c.id))
     : GOLDEN_SET;
-  for (const mode of modes) results.push(await runMode(mode, cases));
+  for (const mode of modes) results.push(await runMode(mode, cases, datasetId));
   return results;
 }
 
@@ -281,8 +315,7 @@ export async function datasetUrl(): Promise<string | null> {
     const dataset = (await langfuseApi(
       `/api/public/v2/datasets/${encodeURIComponent(DATASET)}`,
     )) as { id: string };
-    const base = traceUrl("x").replace(/\/trace\/x$/, "");
-    return `${base}/project/${projects.data[0].id}/datasets/${dataset.id}`;
+    return `${langfuseBaseUrl()}/project/${projects.data[0].id}/datasets/${dataset.id}`;
   } catch {
     return null;
   }

@@ -243,7 +243,11 @@ export function callStream(info: CallInfo, options: StreamOptions) {
   // Read now: the callbacks run later, maybe outside this trace's context.
   const parent = currentTrace();
   const input = promptOf(options);
+  // A failed stream can call onError and then onFinish: report it once.
+  let reported = false;
   const finish = (done: AiCallRow, output?: unknown) => {
+    if (reported) return;
+    reported = true;
     withTrace(parent, () =>
       traceCall(info, done, startTime, { input, output }),
     );

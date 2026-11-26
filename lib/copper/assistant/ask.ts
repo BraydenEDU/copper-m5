@@ -17,10 +17,10 @@ import { hasToolCall, stepCountIs } from "ai";
 import { callStream, THOUGHT_SUMMARIES } from "@/lib/ai/call";
 import {
   event,
+  type ExperimentItem,
   flushLangfuse,
   startSpan,
   trace,
-  updateTrace,
   withTrace,
 } from "@/lib/ai/langfuse";
 import { createLive, type Live } from "@/lib/ai/live";
@@ -60,12 +60,18 @@ export type AskCopperRequest = {
   sessionId?: string;
   /** Extra Langfuse tags, like "eval". */
   tags?: string[];
+  /** The evals: makes this turn a golden-set item in a Langfuse experiment. */
+  experiment?: ExperimentItem;
+  /** The evals: don't send the trace; they send it (or drop a failed try) themselves. */
+  holdTrace?: boolean;
 };
 
 export type AskCopperResult = {
   progress: Live<Progress>;
   /** This turn's trace in Langfuse. */
   traceId: string;
+  /** The trace's root observation, where the evals put their scores. */
+  observationId: string;
 };
 
 /** AGENT_MODE=single runs one support agent; anything else, the two agents. */
@@ -143,6 +149,8 @@ export async function askCopper({
   mode = defaultMode(),
   sessionId,
   tags = [],
+  experiment,
+  holdTrace = false,
 }: AskCopperRequest): Promise<AskCopperResult> {
   const { live, update, done } = createLive<Progress>();
   const first: Agent =
@@ -165,6 +173,7 @@ export async function askCopper({
       limitUsd: desk?.limitUsd,
       history: messages.slice(0, -1),
     },
+    experiment,
   });
   const progress: Progress = {
     steps: [],
@@ -223,7 +232,13 @@ export async function askCopper({
         case "tool-call": {
           toolSpans.set(
             `${call}:${part.toolCallId}`,
-            startSpan(span.ref, part.toolName, part.input, { agent: current }),
+            startSpan(
+              span.ref,
+              part.toolName,
+              part.input,
+              { agent: current },
+              "tool",
+            ),
           );
           const step = toolStep(part.toolCallId);
           if (step) step.input = part.input;
@@ -277,10 +292,13 @@ export async function askCopper({
     run: () => ReturnType<typeof callStream>,
   ) {
     agentsUsed.push(current);
-    const span = startSpan(turn, AGENT_NAMES[current], messages.at(-1), {
-      agent: current,
-      mode,
-    });
+    const span = startSpan(
+      turn,
+      AGENT_NAMES[current],
+      messages.at(-1),
+      { agent: current, mode },
+      "agent",
+    );
     try {
       const next = await withTrace(span.ref, () =>
         follow(current, run(), span),
@@ -300,21 +318,14 @@ export async function askCopper({
     const tools = progress.steps.flatMap((step) =>
       step.type === "tool" ? [step.name] : [],
     );
-    updateTrace(turn, {
-      output: progress.reply,
-      metadata: {
-        mode,
-        useTools,
-        page: desk ? "support" : "home",
-        limitUsd: desk?.limitUsd,
-        history: messages.slice(0, -1),
-        agents: agentsUsed.map((a) => AGENT_NAMES[a]),
-        answeredBy: AGENT_NAMES[progress.agent ?? "copper"],
-        tools,
-        handoffs: progress.steps.filter((s) => s.type === "handoff").length,
-        status: progress.status,
-      },
+    turn.end(progress.reply, {
+      agents: agentsUsed.map((a) => AGENT_NAMES[a]),
+      answeredBy: AGENT_NAMES[progress.agent ?? "copper"],
+      tools,
+      handoffs: progress.steps.filter((s) => s.type === "handoff").length,
+      status: progress.status,
     });
+    if (holdTrace) return;
     await Promise.race([
       flushLangfuse(),
       new Promise((resolve) => setTimeout(resolve, FLUSH_TIMEOUT_MS)),
@@ -362,5 +373,9 @@ export async function askCopper({
     done(snapshot());
   })();
 
-  return { progress: live, traceId: turn.traceId };
+  return {
+    progress: live,
+    traceId: turn.traceId,
+    observationId: turn.parentId,
+  };
 }

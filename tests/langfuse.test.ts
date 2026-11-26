@@ -64,23 +64,52 @@ function modelStreaming(...steps: StreamPart[][]) {
   });
 }
 
-type Event = { type: string; body: Record<string, unknown> };
-let sent: Event[];
+type Span = {
+  name: string;
+  traceId: string;
+  spanId: string;
+  parentSpanId?: string;
+  attrs: Record<string, unknown>;
+};
+let spans: Span[];
+let scores: Record<string, unknown>[];
 
-/** Fake Langfuse: records every batch the app sends. */
+/** An OTLP attribute value back to plain JSON. */
+function plain(value: Record<string, unknown>): unknown {
+  if ("arrayValue" in value)
+    return (
+      value.arrayValue as { values: Record<string, unknown>[] }
+    ).values.map(plain);
+  return Object.values(value)[0];
+}
+
+/** Fake Langfuse: records the OpenTelemetry spans and scores the app sends. */
 function fakeLangfuse() {
-  sent = [];
+  spans = [];
+  scores = [];
   vi.stubEnv("LANGFUSE_PUBLIC_KEY", "pk-lf-test");
   vi.stubEnv("LANGFUSE_SECRET_KEY", "sk-lf-test");
   vi.stubEnv("LANGFUSE_BASE_URL", "https://langfuse.test");
-  return vi
-    .spyOn(globalThis, "fetch")
-    .mockImplementation(async (_url, init) => {
-      sent.push(...JSON.parse(String(init?.body)).batch);
-      return new Response(JSON.stringify({ successes: [], errors: [] }), {
-        status: 207,
-      });
+  return vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+    const body = JSON.parse(String(init?.body));
+    if (String(url).endsWith("/otel/v1/traces"))
+      for (const s of body.resourceSpans[0].scopeSpans[0].spans)
+        spans.push({
+          ...s,
+          attrs: Object.fromEntries(
+            s.attributes.map(
+              (a: { key: string; value: Record<string, unknown> }) => [
+                a.key,
+                plain(a.value),
+              ],
+            ),
+          ),
+        });
+    else scores.push(...body.batch.map((e: { body: unknown }) => e.body));
+    return new Response(JSON.stringify({ successes: [], errors: [] }), {
+      status: 207,
     });
+  });
 }
 
 const desk = { limitUsd: 50, refunds: [] };
@@ -91,13 +120,15 @@ async function ask(
   vi.resetModules();
   vi.stubEnv("GOOGLE_GENERATIVE_AI_API_KEY", "AIza-test-key");
   const { askCopper } = await import("@/lib/copper/assistant/ask");
-  const { progress, traceId } = await askCopper(request);
-  return { final: await finalValue(progress), traceId };
+  const { progress, traceId, observationId } = await askCopper(request);
+  return { final: await finalValue(progress), traceId, observationId };
 }
 
-const of = (type: string) => sent.filter((e) => e.type === type);
-const named = (type: string, name: string) =>
-  of(type).filter((e) => e.body.name === name);
+const named = (name: string) => spans.filter((s) => s.name === name);
+const typed = (type: string) =>
+  spans.filter((s) => s.attrs["langfuse.observation.type"] === type);
+const read = (s: Span, key: string) =>
+  JSON.parse(String(s.attrs[`langfuse.observation.${key}`]));
 
 beforeEach(() => {
   vi.spyOn(console, "info").mockImplementation(() => {});
@@ -116,7 +147,7 @@ describe("Langfuse tracing", () => {
       calls("request_refund", { orderId: "1001" }),
       says("Order #1001 is refunded."),
     );
-    const { final, traceId } = await ask({
+    const { final, traceId, observationId } = await ask({
       messages: [{ role: "user", content: "Refund order 1001" }],
       useTools: true,
       desk,
@@ -126,58 +157,86 @@ describe("Langfuse tracing", () => {
 
     expect(final.reply).toBe("Order #1001 is refunded.");
     expect(fetch).toHaveBeenCalledWith(
-      "https://langfuse.test/api/public/ingestion",
-      expect.objectContaining({ method: "POST" }),
-    );
-    // One trace for the turn, with its question, answer and who answered.
-    const traces = of("trace-create").filter((e) => e.body.id === traceId);
-    expect(traces[0].body).toMatchObject({
-      name: "ask-copper",
-      input: "Refund order 1001",
-      sessionId: "s-1",
-      tags: ["multi-agent"],
-    });
-    expect(traces.at(-1)!.body).toMatchObject({
-      output: "Order #1001 is refunded.",
-      metadata: expect.objectContaining({
-        agents: ["Copper", "Refund agent"],
-        answeredBy: "Refund agent",
-        tools: ["transfer_to_refund_agent", "request_refund"],
-        handoffs: 1,
+      "https://langfuse.test/api/public/otel/v1/traces",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          "x-langfuse-ingestion-version": "4",
+        }),
       }),
-    });
-    // A span per agent, the tools inside the agent that called them.
-    const copper = named("span-create", "Copper")[0].body;
-    const refund = named("span-create", "Refund agent")[0].body;
+    );
+    // Every observation is in this turn's trace, and carries its name,
+    // session and tags.
+    expect(spans.every((s) => s.traceId === traceId)).toBe(true);
+    expect(traceId).toMatch(/^[0-9a-f]{32}$/);
+    for (const s of spans)
+      expect(s.attrs).toMatchObject({
+        "langfuse.trace.name": "ask-copper",
+        "langfuse.session.id": "s-1",
+        "langfuse.trace.tags": ["multi-agent"],
+      });
+    // The root observation is the trace: the question, the answer, and who
+    // answered.
+    const [root] = named("ask-copper").filter((s) => !s.parentSpanId);
+    expect(root.spanId).toBe(observationId);
+    expect(root.attrs["langfuse.observation.input"]).toBe("Refund order 1001");
+    expect(root.attrs["langfuse.observation.output"]).toBe(
+      "Order #1001 is refunded.",
+    );
     expect(
-      named("span-create", "transfer_to_refund_agent")[0].body,
-    ).toMatchObject({ parentObservationId: copper.id });
-    expect(named("span-create", "request_refund")[0].body).toMatchObject({
-      parentObservationId: refund.id,
-      input: { orderId: "1001" },
-      output: expect.objectContaining({ status: "refunded" }),
-    });
-    expect(named("event-create", "handoff")[0].body.input).toEqual({
+      JSON.parse(String(root.attrs["langfuse.trace.metadata.agents"])),
+    ).toEqual(["Copper", "Refund agent"]);
+    expect(root.attrs["langfuse.trace.metadata.answeredBy"]).toBe(
+      "Refund agent",
+    );
+    expect(
+      JSON.parse(String(root.attrs["langfuse.trace.metadata.tools"])),
+    ).toEqual(["transfer_to_refund_agent", "request_refund"]);
+    // An agent observation per agent, the tools inside the agent that called them.
+    const [copper] = named("Copper");
+    const [refund] = named("Refund agent");
+    expect(typed("agent")).toEqual([copper, refund]);
+    expect(copper.parentSpanId).toBe(root.spanId);
+    const [handoff] = named("transfer_to_refund_agent");
+    expect(handoff.parentSpanId).toBe(copper.spanId);
+    const [requested] = named("request_refund");
+    expect(requested).toMatchObject({ parentSpanId: refund.spanId });
+    expect(requested.attrs["langfuse.observation.type"]).toBe("tool");
+    expect(read(requested, "input")).toEqual({ orderId: "1001" });
+    expect(read(requested, "output")).toMatchObject({ status: "refunded" });
+    expect(read(named("handoff")[0], "input")).toEqual({
       from: "Copper",
       to: "Refund agent",
     });
     // Each model call: model, tokens, cost and time, under its agent.
-    const generations = of("generation-create").map((e) => e.body);
+    const generations = typed("generation");
     expect(generations.map((g) => g.name)).toEqual([
       "ask-copper",
       "refund-agent",
     ]);
-    expect(generations[1]).toMatchObject({
-      parentObservationId: refund.id,
-      model: "google/gemini-3.5-flash-lite",
-      usageDetails: { input: 2000, output: 200, total: 2200 },
-      costDetails: { total: expect.any(Number) },
-      startTime: expect.any(String),
-      endTime: expect.any(String),
+    const [, last] = generations;
+    expect(last.parentSpanId).toBe(refund.spanId);
+    expect(last.attrs["langfuse.observation.model.name"]).toBe(
+      "google/gemini-3.5-flash-lite",
+    );
+    expect(read(last, "usage_details")).toEqual({
+      input: 2000,
+      output: 200,
+      total: 2200,
     });
-    expect(
-      sent.every((e) => !("traceId" in e.body) || e.body.traceId === traceId),
-    ).toBe(true);
+    expect(read(last, "cost_details").total).toBeGreaterThan(0);
+    for (const s of spans)
+      expect(
+        BigInt(
+          String((s as unknown as { endTimeUnixNano: string }).endTimeUnixNano),
+        ),
+      ).toBeGreaterThanOrEqual(
+        BigInt(
+          String(
+            (s as unknown as { startTimeUnixNano: string }).startTimeUnixNano,
+          ),
+        ),
+      );
   });
 
   it("sends nothing without Langfuse keys, and the chat still works", async () => {
@@ -189,6 +248,57 @@ describe("Langfuse tracing", () => {
     });
     expect(final.reply).toBe("Hello!");
     expect(fetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("eval traces in a Langfuse experiment", () => {
+  it("marks the turn as a golden-set item and scores its root observation", async () => {
+    fakeLangfuse();
+    model = modelStreaming(says("Polished Copper, Patina Teal and Night Sky."));
+    const { traceId, observationId } = await ask({
+      messages: [{ role: "user", content: "What colors?" }],
+      useTools: true,
+      desk,
+      experiment: {
+        id: "exp-1",
+        name: "multi-agent abc1234",
+        description: "Two agents",
+        datasetId: "ds-1",
+        itemId: "golden-colors",
+        expectedOutput: { good: "Lists the three colors." },
+      },
+    });
+    const root = spans.find((s) => s.spanId === observationId)!;
+    expect(root.attrs).toMatchObject({
+      "langfuse.environment": "experiment",
+      "langfuse.experiment.id": "exp-1",
+      "langfuse.experiment.name": "multi-agent abc1234",
+      "langfuse.experiment.dataset.id": "ds-1",
+      "langfuse.experiment.item.id": "golden-colors",
+      "langfuse.experiment.item.root_observation_id": observationId,
+      "langfuse.experiment.description": "Two agents",
+    });
+    expect(
+      JSON.parse(
+        String(root.attrs["langfuse.experiment.item.expected_output"]),
+      ),
+    ).toEqual({ good: "Lists the three colors." });
+    // Child observations carry the experiment too, like OTel baggage.
+    for (const s of spans)
+      expect(s.attrs["langfuse.experiment.item.id"]).toBe("golden-colors");
+
+    const { score, flushLangfuse } = await import("@/lib/ai/langfuse");
+    score(traceId, "passed", 1, { dataType: "BOOLEAN", observationId });
+    await flushLangfuse();
+    expect(scores).toEqual([
+      expect.objectContaining({
+        traceId,
+        observationId,
+        name: "passed",
+        value: 1,
+        dataType: "BOOLEAN",
+      }),
+    ]);
   });
 });
 
@@ -224,8 +334,8 @@ describe("one support agent (AGENT_MODE=single)", () => {
       ]),
     );
     expect(tools).not.toContain("transfer_to_refund_agent");
-    expect(of("trace-create")[0].body.tags).toEqual(["single-agent"]);
-    expect(named("span-create", "Support agent")).toHaveLength(1);
+    expect(spans[0].attrs["langfuse.trace.tags"]).toEqual(["single-agent"]);
+    expect(named("Support agent")).toHaveLength(1);
   });
 
   it("AGENT_MODE=single picks it in the app", async () => {
